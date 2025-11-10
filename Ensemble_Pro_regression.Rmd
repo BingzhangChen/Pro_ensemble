@@ -1,0 +1,457 @@
+
+```{r}
+library(spatialsample)
+library(tidymodels)
+library(hardhat)
+tidymodels_prefer()
+Pico <- read.csv('pro_data.csv') |>
+  select(Depth, Temp, Sal, SSChl, NO3, PO4, Pro, lon, lat, Year,DOY)
+```
+
+We run imputation techniques to interpolate the missing values of predictors.
+
+```{r imputation}
+library(mice)
+Pico_imputed <- mice(Pico, method = "cart")
+Pico$Temp <- complete(Pico_imputed)$Temp
+Pico$NO3 <- complete(Pico_imputed)$NO3
+Pico$PO4 <- complete(Pico_imputed)$PO4
+Pico$SSChl <- complete(Pico_imputed)$SSChl
+Pico$Sal <- complete(Pico_imputed)$Sal
+```
+
+```{r test/training_split}
+Pico <- 
+  Pico |>
+  mutate(
+    log10Pro = log10(Pro + 1)
+  )
+
+
+library(sf)
+Pico_sf <- st_as_sf(Pico, coords = c("lon", "lat"), crs = 4326)
+
+
+set.seed(121)
+
+candidate_areas <- list(
+  area1 = c(xmin = 112, xmax = 120, ymin = 10, ymax = 15),
+  area2 = c(xmin = 120, xmax = 130, ymin = 31, ymax = 34)
+)
+
+selected_areas <- sample(names(candidate_areas), size = 2)
+print(selected_areas)
+
+in_selected_area <- function(lon, lat) {
+  any(sapply(selected_areas, function(area) {
+    coords <- candidate_areas[[area]]
+    lon >= coords["xmin"] & lon <= coords["xmax"] &
+      lat >= coords["ymin"] & lat <= coords["ymax"]
+  }))
+}
+
+coords <- st_coordinates(Pico_sf)
+Pico_sf$in_test <- mapply(in_selected_area, coords[,1], coords[,2])
+
+test_data <- Pico_sf %>% filter(in_test)
+train_data <- Pico_sf %>% filter(!in_test)
+
+rects <- lapply(selected_areas, function(area) {
+  coords <- candidate_areas[[area]]
+  st_polygon(list(matrix(
+    c(coords["xmin"], coords["ymin"],
+      coords["xmax"], coords["ymin"],
+      coords["xmax"], coords["ymax"],
+      coords["xmin"], coords["ymax"],
+      coords["xmin"], coords["ymin"]),
+    ncol = 2, byrow = TRUE
+  )))
+}) %>% st_sfc(crs = 4326)
+
+p <- ggplot() +
+  geom_sf(data = train_data, aes(color = "Train"), alpha = 0.6,size = 0.1) +
+  geom_sf(data = test_data, aes(color = "Test"), alpha = 0.8, size = 0.1) +
+  geom_sf(data = rects, fill = NA, color = "black", linetype = "dashed", size = 0.1) +
+  scale_color_manual(values = c("Train" = "steelblue", "Test" = "firebrick")) +
+  theme_minimal() +
+  labs(title = "Train/Test Split by Fixed Sea Areas",
+       color = "Dataset")
+
+p
+
+```
+
+
+
+```{r spatial_samlping}
+set.seed(1001)
+folds <- spatial_clustering_cv(train_data, v = 5)
+
+#Visualize the folds
+autoplot(folds)
+
+Pico_split <- folds  
+
+set.seed(1002)
+Pico_folds <- folds  
+
+train_df <- st_drop_geometry(train_data)
+test_df <- st_drop_geometry(test_data)
+```
+
+```{r define_recipe}
+# Define recipe without PCA
+normalized_rec <- 
+  recipe(log10Pro ~ Depth + NO3 + PO4 + Sal + SSChl + Temp + DOY,
+         data = train_df) |>
+  step_YeoJohnson(NO3) |>
+  step_YeoJohnson(PO4) |>
+  step_YeoJohnson(SSChl) |>
+  step_normalize(all_predictors())
+
+# Define recipe with PCA
+normalized_pca_rec <- 
+  recipe(log10Pro ~ Depth + NO3 + PO4 + Sal + SSChl  + Temp + DOY,
+         data = train_df) |>
+  step_YeoJohnson(NO3) |>
+  step_YeoJohnson(PO4) |>
+  step_YeoJohnson(SSChl) |>
+  step_normalize(all_predictors()) |>
+  step_pca(all_numeric_predictors(), num_comp = tune()) |>
+  step_normalize(all_predictors())
+```
+
+
+```{r model_specification_setup}
+
+linear_reg_spec <- 
+  linear_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine('glmnet')
+
+nnet_spec <-
+  mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) %>%
+  set_engine('nnet', MaxNWts = 2600) %>%
+  set_mode('regression')
+
+svm_r_spec <- 
+  svm_rbf(cost = tune(), rbf_sigma = tune()) %>%
+  set_engine('kernlab') %>%
+  set_mode('regression')
+
+rf_spec <-
+  rand_forest(mtry = tune(), min_n = tune(), trees = tune()) %>%
+  set_engine('ranger') %>%
+  set_mode('regression')
+
+BRT_spec <-
+  boost_tree(mtry  = tune(), min_n = tune(), trees = tune(), learn_rate = tune(), loss_reduction = tune(), stop_iter = tune()) |>
+  set_engine('xgboost') |>
+  set_mode('regression')
+```
+
+
+```{r normalized_wflow_set}
+normalized <- 
+  workflow_set(
+    preproc = list(normalized = normalized_rec,
+                   normalized_pca = normalized_pca_rec),
+    models  = list(
+                   SVM_radial = svm_r_spec,
+                   nnet       = nnet_spec
+                   )
+  )
+```
+
+
+```{r tree_rec}
+tree_rec <- 
+  recipe(log10Pro ~ Depth + NO3 + PO4 + Sal + SSChl + Temp + DOY,
+         data = train_df)
+
+tree_rec_pca <- 
+  recipe(log10Pro ~ Depth + NO3 + PO4 + Sal + SSChl  + Temp + DOY,
+         data = train_df) |>
+  step_pca(all_numeric_predictors(), threshold= 0.99)
+
+no_pre_proc <-
+  workflow_set(
+    preproc = list(simple = tree_rec, simple_pca = tree_rec_pca),
+    models = list(RF = rf_spec, BRT = BRT_spec)
+  )
+```
+
+
+```{r}
+N_feature <- 7
+rf_param <-
+  rf_spec |>
+  extract_parameter_set_dials() |>
+  update(
+    mtry  = mtry(c(1, N_feature)),
+    trees = trees(c(10 * N_feature, 2000)),
+    min_n = min_n(c(1, 100))
+  )
+
+BRT_param <-
+  BRT_spec |>
+  extract_parameter_set_dials() |>
+  update(
+    mtry  = mtry(c(1, N_feature)),
+    trees = trees(c(10 * N_feature, 2000)),
+    min_n = min_n(c(1, 100))
+  )
+no_pre_proc <- 
+  no_pre_proc %>%
+  option_add(param_info = rf_param,  id = 'simple_RF') |>
+  option_add(param_info = rf_param,  id = 'simple_pca_RF') |>
+  option_add(param_info = BRT_param, id = 'simple_BRT')
+```
+
+
+```{r}
+poly_recipe <-
+  normalized_rec %>%
+  step_poly(all_predictors()) %>%
+  step_interact(~ all_predictors():all_predictors())
+
+with_features <-
+  workflow_set(
+    preproc = list(full_quad = poly_recipe),
+    models = list(linear_reg = linear_reg_spec)
+  )
+
+```
+
+
+```{r}
+all_workflows <-
+  bind_rows(no_pre_proc, normalized, with_features)  %>%
+  mutate(wflow_id = gsub('(simple_)|(normalized_)', '', wflow_id))
+```
+
+
+```{r model_tuning}
+#Tuning and evaluating the models
+#Apply grid search to each workflow using up to 25 different parameter candidates
+
+#The results show that the option and result columns have been updated
+grid_ctrl <-
+  control_grid(
+    save_pred     = TRUE,
+    parallel_over = 'everything',
+    save_workflow = TRUE
+  )
+
+system.time(
+    grid_results <-
+      all_workflows %>%
+      workflow_map(seed      = 1003,
+                   resamples = folds,
+                   grid      = 50,
+                   control   = grid_ctrl,
+                   verbose   = TRUE)
+)
+
+```
+
+Stack models
+
+```{r}
+#Creating the Training set for stacking
+## Assemble the assessment set predictions for the training dataset from each candidate model
+## First, create an empty data stack using the stacks() function and then add candidate models
+collect_notes(grid_results)
+
+library(stacks)
+concrete_stack <- 
+  stacks() %>%
+  add_candidates(grid_results) #includes only the model configurations that have complete results
+
+```
+
+
+```{r}
+#Blend the predictions
+#Create a meta-learning model in which the assessment set predictions are the predictors of the observed outcome data
+#The most commonly used model is a regularized generalized linear model via the lasso penalty
+
+#It is helpful to constrain the blending coefficients to be nonnegative (Breiman 1996b)
+set.seed(1004)
+
+ens <- blend_predictions(concrete_stack)
+
+```
+
+
+```{r}
+#Show the details of the meta-learning model
+#
+ens
+```
+
+
+```{r}
+#Show the contribution of each model type
+autoplot(ens, 'weights') +
+  geom_text(aes(x = weight + 0.01, label = model), hjust = 0) +
+  theme(legend.position = 'none') +
+  lims(x = c(-0.01, 2.1))
+```
+
+
+```{r}
+#Fit the member models
+#Update the stacking object with the fitted workflow objects for each member
+
+ens <- fit_members(ens) #this stack model can be used for prediction
+```
+
+Evaluate the ensemble model on the test data (pr_auc, roc_auc, f1_score, confusion_matrix)
+
+```{r}
+library(pROC)
+ens_test_pred <- ens_test_pred %>%
+  mutate(Pro_predicted = pmax(10^.pred - 1, 0),
+         Pro_presence_actual = if_else(Pro > 0, 1, 0))
+
+roc_curve <- roc(
+  response = ens_test_pred$Pro_presence_actual,
+  predictor = ens_test_pred$.pred  
+)
+
+auc_value <- auc(roc_curve)
+print(paste("AUC =", round(auc_value, 3)))
+
+plot(roc_curve, col = "black", lwd = 2, main = "ROC Curve for Ensemble Model")
+```
+
+```{r}
+library(yardstick)
+
+class_metrics <- metric_set(f_meas)
+
+ens_test_pred <- ens_test_pred %>%
+  mutate(
+    Pro_presence_predicted = if_else(Pro_predicted > 2.5, 1, 0),
+    Pro_presence_predicted = factor(Pro_presence_predicted, levels = c(0, 1)),
+    Pro_presence_actual = factor(Pro_presence_actual, levels = c(0, 1))
+  )
+
+f1_score <- f_meas(
+  ens_test_pred,
+  truth = Pro_presence_actual,
+  estimate = Pro_presence_predicted
+)
+
+print(f1_score)
+
+table(ens_test_pred$Pro_predicted)
+
+```
+
+```{r}
+library(yardstick)
+
+cm <- ens_test_pred %>%
+  conf_mat(truth = Pro_presence_actual, estimate = Pro_presence_predicted)
+
+print(cm)
+
+p_heatmap <- autoplot(cm, type = "heatmap") + 
+  theme_minimal() 
+
+p_heatmap
+p_mosaic
+```
+
+
+```{r}
+prauc_val <- pr_auc(
+  ens_test_pred,
+  truth = Pro_presence_actual,   
+  Pro_predicted,                
+  event_level = "second"        
+)
+
+print(prauc_val)
+
+library(ggplot2)
+
+pr_df <- pr_curve(
+  ens_test_pred,
+  truth = Pro_presence_actual,
+  Pro_predicted,
+  event_level = "second"
+)
+
+p_pr <- ggplot(pr_df, aes(x = recall, y = precision)) +
+  geom_line(color = "black", size = 1.2) +
+  geom_point(size = 0.8, color = "black", alpha = 0.8) +
+  geom_abline(linetype = "dashed", color = "gray60", linewidth = 0.5) +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 13, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(linewidth = 0.3, color = "gray85")
+  ) +
+  labs(
+    x = "Recall",
+    y = "Precision"
+  )
+print(p_pr)
+
+
+```
+
+Explain the ensemble model
+
+```{r}
+library(DALEXtra)
+vip_features <- normalized_rec$var_info$variable
+vip_train <- 
+  Pico %>% 
+  select(all_of(vip_features))
+
+explainer_ens <- 
+  explain_tidymodels(
+    ens, 
+    data =   vip_train |> select(Depth, Temp, NO3, PO4, SSChl, Sal, DOY), 
+    y = Pico |> select(log10Pro),
+    label = "Ensemble",
+    verbose = FALSE
+)
+```
+
+
+```{r}
+#Check the variable importance using the _model_parts()_ function:
+
+model_parts_ens <- model_parts(explainer_ens)
+plot(model_parts_ens)
+
+
+p <- plot(model_parts_ens) +
+  #xlim(0, 8) +
+  theme(
+    panel.background = element_rect(fill = "transparent", colour = NA),
+    plot.background  = element_rect(fill = "transparent", colour = NA),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.grid.major.x = element_blank(), 
+    panel.grid.minor.x = element_blank(),
+    axis.ticks.x = element_line(colour = "black", size = 0.6),    
+    axis.ticks.y = element_line(colour = "black", size = 0.6),    
+    axis.ticks.length = unit(0.25, "cm")                          
+  )
+
+```
+
+Save models for prediction
+
+```{r save_model}
+save(ens, file = 'ens_regression.Rdata')
+```
