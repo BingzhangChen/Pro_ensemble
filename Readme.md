@@ -1,6 +1,6 @@
 # Modelling Prochlorococcus boundary README
 
-This file accompanies the paper entitled " Salinity-Driven Boundary of Prochlorococcus in the Northwest Pacific Revealed by Ensemble Machine Learning" submitted to Global Biogeochemical Cycles.
+This file accompanies the paper entitled " Salinity-Driven Boundary of Prochlorococcus in the Northwest Pacific Revealed by Ensemble Machine Learning" submitted to Journal of Geophysical Research: Oceans.
 
 ## Authors
 
